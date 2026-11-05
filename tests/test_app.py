@@ -247,3 +247,24 @@ async def test_bjobs_disabled(workflow: Path, fake_bjobs: Path) -> None:
         await wait_for(pilot, lambda: rows(app, "active") == 2)
         await pilot.pause(0.3)
         assert cell(app, "active", 3481, "state") == "-"
+
+
+async def test_retried_job_stays_in_failed_tab(tmp_path: Path) -> None:
+    from .test_parser import RETRY_LOG
+
+    log_dir = tmp_path / ".snakemake" / "log"
+    log_dir.mkdir(parents=True)
+    log = log_dir / "2026-01-01T000000.000000.snakemake.log"
+    log.write_text(RETRY_LOG)
+    app = SnakeseeApp(tmp_path, interval=0.05)
+    async with app.run_test(size=(200, 40)) as pilot:
+        await wait_for(pilot, lambda: rows(app, "failed") == 1 and rows(app, "active") == 1)
+        assert cell(app, "failed", 7, "outcome") == "retrying #2"
+        assert "LSF-job '501' failed" in cell(app, "failed", 7, "message")
+        tab = str(app.query_one(TabbedContent).get_tab("tab-failed").label)
+        assert tab == "Failed (0 + 1 retried)"
+        with log.open("a") as fh:
+            fh.write("[Thu Nov  5 12:30:00 2026]\nFinished jobid: 7 (Rule: fit)\n")
+        await wait_for(pilot, lambda: rows(app, "done") == 1)
+        assert rows(app, "active") == 0 and rows(app, "failed") == 1
+        assert cell(app, "failed", 7, "outcome") == "ok on #2"

@@ -80,6 +80,7 @@ COLUMNS: dict[JobStatus, list[tuple[str, str]]] = {
         ("rule", "Rule"),
         ("wildcards", "Wildcards"),
         ("external", "Cluster ID"),
+        ("outcome", "Outcome"),
         ("ended", "Failed at"),
         ("mem", "Max mem"),
         ("pct", "% req"),
@@ -98,7 +99,7 @@ COLUMNS: dict[JobStatus, list[tuple[str, str]]] = {
 }
 # Columns filled in later (by the resource worker) get a fixed width: DataTable sizes
 # columns from their initial content, and later updates don't widen them.
-FIXED_WIDTHS = {"state": 5, "mem": 7, "pct": 5, "runtime": 8}
+FIXED_WIDTHS = {"state": 5, "mem": 7, "pct": 5, "runtime": 8, "outcome": 13}
 TABLE_IDS = {
     JobStatus.ACTIVE: "active",
     JobStatus.FAILED: "failed",
@@ -123,6 +124,31 @@ def _end_key(job: Job) -> float:
     return job.end_time or 0.0
 
 
+def _sort_key(job: Job, table: JobStatus) -> float:
+    """Newest first: by failure time in the Failed table, end time otherwise."""
+    if table is JobStatus.FAILED:
+        return job.failure_time or job.end_time or 0.0
+    return job.end_time or 0.0
+
+
+def tables_for(job: Job) -> set[JobStatus]:
+    """Tables a job appears in: its status, plus Failed if any attempt failed."""
+    tables = {job.status}
+    if job.failed_attempts:
+        tables.add(JobStatus.FAILED)
+    return tables
+
+
+def outcome_cell(job: Job) -> Text:
+    """What happened after a failure: still failed, being retried, or succeeded on retry."""
+    if job.status is JobStatus.FAILED:
+        times = f" ×{job.failed_attempts}" if job.failed_attempts > 1 else ""
+        return Text(f"failed{times}", style="bold red")
+    if job.status is JobStatus.ACTIVE:
+        return Text(f"retrying #{job.attempts}", style="yellow")
+    return Text(f"ok on #{job.attempts}", style="green")
+
+
 def pct_cell(res: JobResources | None) -> Text:
     """Max memory as % of the request, highlighted when close to the limit."""
     frac = res.mem_fraction if res is not None else None
@@ -132,8 +158,13 @@ def pct_cell(res: JobResources | None) -> Text:
     return Text(f"{100 * frac:.0f}%", style=style)
 
 
-def job_cells(job: Job, res: JobResources | None, now: float) -> dict[str, Any]:
-    """Cell values for a job's row in the table matching its status."""
+def job_cells(
+    job: Job, res: JobResources | None, now: float, table: JobStatus | None = None
+) -> dict[str, Any]:
+    """Cell values for a job's row in ``table`` (default: the table matching its status)."""
+    table = job.status if table is None else table
+    if table is JobStatus.FAILED and job.status is not JobStatus.FAILED:
+        res = None  # usage is for the current (retried) attempt, not the failed one
     cells: dict[str, Any] = {
         "jobid": job.jobid,
         "rule": job.rule,
@@ -142,14 +173,15 @@ def job_cells(job: Job, res: JobResources | None, now: float) -> dict[str, Any]:
         "mem": fmt_mem(res.max_mem_mb if res else None),
         "pct": pct_cell(res),
     }
-    if job.status is JobStatus.ACTIVE:
+    if table is JobStatus.ACTIVE:
         stat = res.stat if res is not None and res.stat else "-"
         cells["state"] = Text(stat, style="green" if stat == "RUN" else "dim")
         cells["submitted"] = fmt_time(job.submit_time, now)
         cells["elapsed"] = fmt_duration(now - job.submit_time if job.submit_time else None)
-    elif job.status is JobStatus.FAILED:
-        cells["ended"] = fmt_time(job.end_time, now)
-        message = res.lsf_note if res is not None and res.lsf_note else job.error_message
+    elif table is JobStatus.FAILED:
+        cells["outcome"] = outcome_cell(job)
+        cells["ended"] = fmt_time(job.failure_time or job.end_time, now)
+        message = res.lsf_note if res is not None and res.lsf_note else job.failure_message
         cells["message"] = truncate(message, MESSAGE_WIDTH)
     else:
         cells["runtime"] = fmt_duration(res.run_time_s if res else None)
@@ -200,7 +232,8 @@ class SnakeseeApp(App[None]):
         self.interval = interval
         self.monitor = WorkflowMonitor(workflow_dir, log_file)
         self.jobs: dict[int, Job] = {}
-        self._row_table: dict[int, JobStatus] = {}
+        self._row_table: dict[int, set[JobStatus]] = {}
+        """jobid -> tables the job has a row in (Failed + Active/Done after a retry)."""
         self.summary = RunSummary()
         self.log_path: Path | None = None
         self.log_mtime: float | None = None
@@ -267,25 +300,27 @@ class SnakeseeApp(App[None]):
         worker = get_current_worker()
         use_bjobs = self.bjobs_interval > 0 and bjobs_available()
         last_bjobs = float("-inf")
-        attempts: dict[Path, tuple[int, float]] = {}
+        attempts: dict[tuple[Path, int], tuple[int, float]] = {}
         while not (worker.is_cancelled or self._stopping):
             try:
                 active, finished = self.call_from_thread(self._resource_targets)
             except RuntimeError:
                 return
-            results: dict[int, JobResources] = {}
+            results: dict[int, tuple[int, JobResources]] = {}
             now = time.monotonic()
             due = now - last_bjobs >= self.bjobs_interval or self._force_bjobs
             if use_bjobs and active and due:
                 self._force_bjobs = False
                 last_bjobs = now
-                by_id = query_bjobs(sorted({ext for _, ext in active}))
-                results.update((jobid, by_id[ext]) for jobid, ext in active if ext in by_id)
+                by_id = query_bjobs(sorted({ext for _, _, ext in active}))
+                for jobid, attempt, ext in active:
+                    if ext in by_id:
+                        results[jobid] = (attempt, by_id[ext])
             reads = 0
-            for jobid, path in finished:
+            for jobid, attempt, path in finished:
                 if reads >= REPORT_READS_PER_TICK:
                     break
-                n, last = attempts.get(path, (0, 0.0))
+                n, last = attempts.get((path, attempt), (0, 0.0))
                 if n >= REPORT_MAX_ATTEMPTS or (n and now - last < REPORT_RETRY):
                     continue
                 reads += 1
@@ -294,9 +329,9 @@ class SnakeseeApp(App[None]):
                 except OSError:
                     res = None
                 if res is None:  # not written yet, or no LSF report in it
-                    attempts[path] = (n + 1, now)
+                    attempts[(path, attempt)] = (n + 1, now)
                 else:
-                    results[jobid] = res
+                    results[jobid] = (attempt, res)
             if results:
                 try:
                     self.call_from_thread(self._apply_resources, results)
@@ -305,38 +340,45 @@ class SnakeseeApp(App[None]):
             self._resource_wake.wait(RESOURCE_TICK)
             self._resource_wake.clear()
 
-    def _resource_targets(self) -> tuple[list[tuple[int, str]], list[tuple[int, Path]]]:
-        """(active jobs to query with bjobs, shown finished jobs whose report is still unread)."""
-        active: list[tuple[int, str]] = []
+    def _resource_targets(
+        self,
+    ) -> tuple[list[tuple[int, int, str]], list[tuple[int, int, Path]]]:
+        """Shown jobs needing usage data, as (jobid, attempt, ...).
+
+        Returns active jobs to query with bjobs, and finished jobs whose LSF report
+        hasn't been read yet (newest first).
+        """
+        active: list[tuple[int, int, str]] = []
         finished: list[Job] = []
-        for jobid, status in self._row_table.items():
+        for jobid in self._row_table:
             job = self.jobs[jobid]
-            if status is JobStatus.ACTIVE:
+            if job.status is JobStatus.ACTIVE:
                 if job.external_id:
-                    active.append((jobid, job.external_id))
+                    active.append((jobid, job.attempts, job.external_id))
             elif job.cluster_log:
                 res = self.resources.get(jobid)
                 if res is None or not res.final:
                     finished.append(job)
         finished.sort(key=_end_key, reverse=True)
         return active, [
-            (j.jobid, resolve(j.cluster_log or "", self.workflow_dir)) for j in finished
+            (j.jobid, j.attempts, resolve(j.cluster_log or "", self.workflow_dir)) for j in finished
         ]
 
-    def _apply_resources(self, results: dict[int, JobResources]) -> None:
+    def _apply_resources(self, results: dict[int, tuple[int, JobResources]]) -> None:
         now = time.time()
         log_screen = self.screen if isinstance(self.screen, LogScreen) else None
-        for jobid, res in results.items():
+        for jobid, (attempt, res) in results.items():
             job = self.jobs.get(jobid)
             old = self.resources.get(jobid)
-            if job is None or (old is not None and old.final and not res.final):
+            if job is None or job.attempts != attempt:
+                continue  # stale: the job was retried since this was fetched
+            if old is not None and old.final and not res.final:
                 continue
             self.resources[jobid] = res
-            status = self._row_table.get(jobid)
-            if status is not None:
+            for status in self._row_table.get(jobid, ()):
                 table = self.query_one(f"#{TABLE_IDS[status]}", DataTable)
-                before = job_cells(job, old, now)
-                for col, value in job_cells(job, res, now).items():
+                before = job_cells(job, old, now, status)
+                for col, value in job_cells(job, res, now, status).items():
                     if before.get(col) != value:
                         table.update_cell(str(jobid), col, value)
             if log_screen is not None and log_screen.job.jobid == jobid:
@@ -374,19 +416,24 @@ class SnakeseeApp(App[None]):
         log_screen = self.screen if isinstance(self.screen, LogScreen) else None
         for job in jobs:
             key = str(job.jobid)
-            old = self._row_table.get(job.jobid)
-            if old is not None and old is not job.status:
-                tables[old].remove_row(key)
-                del self._row_table[job.jobid]
-                old = None
-            if old is None:
-                new_rows[job.status].append(job)
-            else:
-                res = self.resources.get(job.jobid)
-                previous = job_cells(self.jobs[job.jobid], res, now)
-                for col, value in job_cells(job, res, now).items():
-                    if previous.get(col) != value:
-                        tables[old].update_cell(key, col, value)
+            prev = self.jobs.get(job.jobid)
+            old_res = self.resources.get(job.jobid)
+            if prev is not None and prev.attempts != job.attempts:
+                self.resources.pop(job.jobid, None)  # usage was for the previous attempt
+            res = self.resources.get(job.jobid)
+            shown_in = self._row_table.setdefault(job.jobid, set())
+            wanted = tables_for(job)
+            for status in shown_in - wanted:
+                tables[status].remove_row(key)
+            for status in shown_in & wanted:
+                assert prev is not None
+                before = job_cells(prev, old_res, now, status)
+                for col, value in job_cells(job, res, now, status).items():
+                    if before.get(col) != value:
+                        tables[status].update_cell(key, col, value)
+            for status in wanted - shown_in:
+                new_rows[status].append(job)
+            shown_in &= wanted
             self.jobs[job.jobid] = job
             if log_screen is not None and log_screen.job.jobid == job.jobid:
                 log_screen.update_job(job)
@@ -394,6 +441,9 @@ class SnakeseeApp(App[None]):
         for status, pending in new_rows.items():
             if pending:
                 self._add_rows(tables[status], status, pending, now)
+        for job in jobs:  # jobs that ended up with no rows (e.g. beyond ROW_LIMIT)
+            if not self._row_table.get(job.jobid, True):
+                del self._row_table[job.jobid]
         for status, table in tables.items():
             _restore_cursor(table, cursor_keys[status])
         self._update_tab_titles()
@@ -409,46 +459,59 @@ class SnakeseeApp(App[None]):
         columns = COLUMNS[status]
 
         def add(job: Job) -> None:
-            cells = job_cells(job, self.resources.get(job.jobid), now)
+            cells = job_cells(job, self.resources.get(job.jobid), now, status)
             table.add_row(*(cells[c] for c, _ in columns), key=str(job.jobid))
-            self._row_table[job.jobid] = status
+            self._row_table.setdefault(job.jobid, set()).add(status)
+
+        def drop(job: Job) -> None:
+            shown_in = self._row_table.get(job.jobid)
+            if shown_in is not None:
+                shown_in.discard(status)
+                if not shown_in:
+                    del self._row_table[job.jobid]
 
         if status is JobStatus.ACTIVE:
             for job in jobs:
                 add(job)
             return
 
+        def key(job: Job) -> float:
+            return _sort_key(job, status)
+
         shown = [self.jobs[int(k.value or -1)] for k in table.rows]
-        keep = sorted(shown + jobs, key=_end_key, reverse=True)[:ROW_LIMIT]
+        keep = sorted(shown + jobs, key=key, reverse=True)[:ROW_LIMIT]
         keep_ids = {j.jobid for j in keep}
         evicted = [j for j in shown if j.jobid not in keep_ids]
         if len(evicted) > REBUILD_THRESHOLD:
             # remove_row is O(rows) per call; one clear + bulk add is far cheaper.
             table.clear()
             for job in shown:
-                self._row_table.pop(job.jobid, None)
+                drop(job)
             for job in keep:
                 add(job)
         else:
             for job in evicted:
                 table.remove_row(str(job.jobid))
-                del self._row_table[job.jobid]
+                drop(job)
             for job in jobs:
                 if job.jobid in keep_ids:
                     add(job)
-        table.sort("jobid", key=lambda jid: _end_key(self.jobs[jid]), reverse=True)
+        table.sort("jobid", key=lambda jid: key(self.jobs[jid]), reverse=True)
 
     def _update_tab_titles(self) -> None:
         tabs = self.query_one(TabbedContent)
         s = self.summary
         counts = {
             JobStatus.ACTIVE: s.n_active,
-            JobStatus.FAILED: s.n_failed,
+            JobStatus.FAILED: s.n_failed + s.n_retried,
             JobStatus.DONE: s.n_done,
         }
         for status, table_id in TABLE_IDS.items():
             shown = self.query_one(f"#{table_id}", DataTable).row_count
-            label = f"{TAB_TITLES[status]} ({counts[status]})"
+            if status is JobStatus.FAILED and s.n_retried:
+                label = f"Failed ({s.n_failed} + {s.n_retried} retried)"
+            else:
+                label = f"{TAB_TITLES[status]} ({counts[status]})"
             if shown < counts[status]:
                 label += f" newest {shown}"
             tabs.get_tab(f"tab-{table_id}").label = label
@@ -489,14 +552,16 @@ class SnakeseeApp(App[None]):
         text.append(f"   active {s.n_active}", style="green")
         stats = [
             self.resources[j].stat
-            for j, st in self._row_table.items()
-            if st is JobStatus.ACTIVE and j in self.resources
+            for j, shown_in in self._row_table.items()
+            if JobStatus.ACTIVE in shown_in and j in self.resources
         ]
         if stats:
             n_run = sum(1 for x in stats if x == "RUN")
             n_pend = sum(1 for x in stats if x == "PEND")
             text.append(f" ({n_run} running, {n_pend} queued)", style="green")
         text.append(f"  failed {s.n_failed}", style="red" if s.n_failed else "")
+        if s.n_retried:
+            text.append(f" (+{s.n_retried} retried)", style="yellow")
         text.append(f"  done {s.n_done}")
         text.append(f"  pending {s.n_pending}", style="dim")
         if self.log_mtime is not None:

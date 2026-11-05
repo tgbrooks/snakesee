@@ -88,6 +88,7 @@ class LogParser:
         self._version = ""
         self._command = ""
         self._counts = {s: 0 for s in JobStatus}
+        self._retried: set[int] = set()
         self._rule_status: dict[str, dict[JobStatus, int]] = {}
         self._rule_first_seen: dict[str, int] = {}
         # Rule DAG, inferred from jobs whose inputs are outputs of earlier jobs in this run.
@@ -138,6 +139,7 @@ class LogParser:
             n_active=self._counts[JobStatus.ACTIVE],
             n_done=self._counts[JobStatus.DONE],
             n_failed=self._counts[JobStatus.FAILED],
+            n_retried=len(self._retried),
             snakemake_version=self._version,
             command=self._command,
             rules=self._rule_infos(),
@@ -336,6 +338,9 @@ class LogParser:
                 self.jobs[jobid] = job
                 self._count(job.rule, JobStatus.ACTIVE, 1)
             job.end_time = self._last_time
+            job.failed_attempts += 1
+            job.failure_time = self._last_time
+            job.failure_message = ""
             self._saw_error = True
             self._set_status(job, JobStatus.FAILED)
         self._changed.add(jobid)
@@ -361,6 +366,7 @@ class LogParser:
             if key == "message":
                 idx = value.find(MESSAGE_SUFFIX_NOISE)
                 job.error_message = (value[:idx] if idx >= 0 else value).strip()
+                job.failure_message = job.error_message
             elif key == "external_jobid" and not job.external_id:
                 job.external_id = value.strip()
             elif key == "log" and not job.cluster_log and not job.rule_logs:
@@ -398,3 +404,7 @@ class LogParser:
         self._count(job.rule, job.status, -1)
         self._count(job.rule, status, 1)
         job.status = status
+        if job.retried:
+            self._retried.add(job.jobid)
+        else:
+            self._retried.discard(job.jobid)

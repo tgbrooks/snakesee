@@ -232,6 +232,11 @@ class LogScreen(Screen[None]):
             t.append(f"  attempt {job.attempts}", style="yellow")
         if job.error_message:
             t.append(f"\n{job.error_message}", style="red")
+        elif job.retried:
+            failed = "attempt failed" if job.failed_attempts == 1 else "attempts failed"
+            t.append(f"\n{job.failed_attempts} earlier {failed}", style="yellow")
+            if job.failure_message:
+                t.append(f": {job.failure_message}", style="yellow")
         res = self.resources
         if res is not None:
             t.append("\n")

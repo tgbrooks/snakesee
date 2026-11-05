@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from dataclasses import field
+from dataclasses import replace
 from enum import Enum
 
 
@@ -45,25 +46,23 @@ class Job:
     submit_time: float | None = None
     end_time: float | None = None
     error_message: str = ""
+    """Error of the current attempt (cleared when the job is retried)."""
     attempts: int = 1
+    failed_attempts: int = 0
+    """Attempts that failed, including ones Snakemake then retried (--retries)."""
+    failure_time: float | None = None
+    """When the most recent failed attempt failed (kept across retries)."""
+    failure_message: str = ""
+    """Error of the most recent failed attempt (kept across retries)."""
 
     def copy(self) -> Job:
         """Return a shallow copy safe to hand to another thread."""
-        return Job(
-            jobid=self.jobid,
-            rule=self.rule,
-            status=self.status,
-            wildcards=self.wildcards,
-            threads=self.threads,
-            output=self.output,
-            rule_logs=list(self.rule_logs),
-            external_id=self.external_id,
-            cluster_log=self.cluster_log,
-            submit_time=self.submit_time,
-            end_time=self.end_time,
-            error_message=self.error_message,
-            attempts=self.attempts,
-        )
+        return replace(self, rule_logs=list(self.rule_logs))
+
+    @property
+    def retried(self) -> bool:
+        """An earlier attempt failed but Snakemake retried the job."""
+        return self.failed_attempts > 0 and self.status is not JobStatus.FAILED
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,6 +102,8 @@ class RunSummary:
     n_active: int = 0
     n_done: int = 0
     n_failed: int = 0
+    n_retried: int = 0
+    """Jobs with a failed attempt that Snakemake retried (now active or done)."""
     snakemake_version: str = ""
     command: str = ""
     rules: tuple[RuleInfo, ...] = ()

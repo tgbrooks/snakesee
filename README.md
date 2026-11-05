@@ -54,6 +54,14 @@ snakesee --bjobs-interval 120 # query LSF for running jobs' memory every 2 min (
 | mouse drag, then `ctrl+c` | Copy the selected text |
 | `esc` / `q` | Back |
 
+The Failed tab keeps every job that had a failed attempt, including jobs Snakemake then retried
+(`--retries`). The Outcome column shows `failed`, `retrying #N` or `ok on #N`.
+
+snakesee follows the newest log that belongs to a workflow run. Every non-dry-run `snakemake`
+command (`--unlock`, `--summary`, `--touch`, ...) also writes a log in `.snakemake/log/`, so newer
+logs without any jobs are ignored, with a note in the header. A new run is picked up once it
+prints its job stats.
+
 The Done and Failed tables show the newest 1000 jobs. The tab titles show the full counts.
 
 Copying uses the OSC 52 terminal escape, which most modern terminals support (iTerm2, kitty,

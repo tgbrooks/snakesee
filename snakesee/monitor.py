@@ -8,6 +8,7 @@ Nothing here scales with the size of the workflow's history.
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from dataclasses import field
 from pathlib import Path
@@ -18,11 +19,28 @@ from snakesee.parser import LogParser
 from snakesee.tail import FileTailer
 
 LOG_SUFFIX = ".snakemake.log"
+RUN_PEEK_BYTES = 256 * 1024
+STARTUP_SCAN_LOGS = 20
+# A log that schedules or would schedule jobs. Every non-dry-run snakemake command
+# (--unlock, --summary, --touch, --report, ...) also writes a log, without these.
+RUN_MARKER_RE = re.compile(
+    rb"^(?:Job stats:|Nothing to be done|(?:local)?(?:rule|checkpoint) \w+:\s*$)", re.MULTILINE
+)
 
 
 def log_dir_for(workflow_dir: Path) -> Path:
     """Directory where Snakemake writes its main logs."""
     return workflow_dir / ".snakemake" / "log"
+
+
+def is_run_log(path: Path) -> bool:
+    """Whether a log belongs to a workflow run (rather than e.g. ``snakemake --unlock``)."""
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(RUN_PEEK_BYTES)
+    except OSError:
+        return False
+    return RUN_MARKER_RE.search(head) is not None
 
 
 def list_logs(log_dir: Path) -> list[Path]:
@@ -65,21 +83,58 @@ class WorkflowMonitor:
         self._log_dir_mtime: float | None = None
         self._tailer: FileTailer | None = FileTailer(log_file) if log_file else None
         self.parser = LogParser()
+        self._unqualified: dict[Path, int] = {}
+        """Newer logs that aren't (yet) workflow runs -> size when last checked."""
+        self.note = ""
 
     def _check_for_new_log(self) -> bool:
-        """Switch to a newer log if one appeared. Returns True if switched."""
+        """Switch to the newest log that is a workflow run. Returns True if switched.
+
+        Newer logs without jobs (``--unlock``, ``--summary``, or a run still building
+        its DAG) are skipped, and re-checked whenever they grow.
+        """
         try:
             mtime = os.stat(self.log_dir).st_mtime
         except OSError:
             return False
-        if mtime == self._log_dir_mtime:
-            return False
-        self._log_dir_mtime = mtime
-        logs = list_logs(self.log_dir)
-        if not logs or logs[-1] == self.log_path:
-            return False
-        self.open_log(logs[-1])
-        return True
+        if mtime != self._log_dir_mtime:
+            self._log_dir_mtime = mtime
+            logs = list_logs(self.log_dir)
+            current = self.log_path.name if self.log_path else ""
+            newer = [p for p in logs if p.name > current][-STARTUP_SCAN_LOGS:]
+            for p in newer:
+                self._unqualified.setdefault(p, -1)
+            for p in sorted(self._unqualified)[:-STARTUP_SCAN_LOGS]:
+                del self._unqualified[p]
+        target: Path | None = None
+        for path, last_size in sorted(self._unqualified.items(), reverse=True):
+            try:
+                size = os.stat(path).st_size
+            except OSError:
+                del self._unqualified[path]
+                continue
+            if size == last_size:
+                continue
+            self._unqualified[path] = size
+            if is_run_log(path):
+                target = path
+                break
+        if target is None and self.log_path is None and self._unqualified:
+            # Nothing looks like a run (yet): show the newest log anyway.
+            target = max(self._unqualified)
+        if target is not None:
+            for path in list(self._unqualified):
+                if path.name <= target.name:
+                    del self._unqualified[path]
+            self.open_log(target)
+        skipped = sorted(p.name for p in self._unqualified)
+        self.note = (
+            f"Not switching to newer log {skipped[-1]}: no jobs in it (yet). "
+            "Logs from --unlock, --summary, etc. are ignored."
+            if skipped
+            else ""
+        )
+        return target is not None
 
     def open_log(self, path: Path) -> None:
         """Start reading ``path`` from scratch."""
@@ -111,4 +166,5 @@ class WorkflowMonitor:
             summary=self.parser.summary() if switched else self.parser.drain_summary(),
             log_mtime=log_mtime,
             more=more,
+            message=self.note,
         )

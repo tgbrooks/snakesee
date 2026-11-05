@@ -193,3 +193,57 @@ def test_rule_edges_inferred_from_inputs_and_outputs() -> None:
     assert s.edges == {("fetch", "align"), ("align", "merge"), ("fetch", "merge")}
     assert [r.name for r in s.rules] == ["fetch", "align", "merge"]
     assert [r.first_seen for r in s.rules] == [0, 1, 2]
+
+
+RETRY_LOG = """\
+[Thu Nov  5 12:16:01 2026]
+rule fit:
+    input: a.txt
+    output: b.txt
+    jobid: 7
+    wildcards: x=1
+Job 7 has been submitted with LSF jobid 501 (log: /p/.snakemake/lsf_logs/fit/u.out).
+[Thu Nov  5 12:20:00 2026]
+Error in rule fit:
+    message: LSF-job '501' failed, LSF status is: 'EXIT'For further error details see the cluster/cloud log and the log files of the involved rule(s).
+    jobid: 7
+    input: a.txt
+    output: b.txt
+    log: /p/.snakemake/lsf_logs/fit/u.out (check log file(s) for error details)
+    external_jobid: 501
+Trying to restart job 7.
+[Thu Nov  5 12:20:05 2026]
+rule fit:
+    input: a.txt
+    output: b.txt
+    jobid: 7
+    wildcards: x=1
+Job 7 has been submitted with LSF jobid 502 (log: /p/.snakemake/lsf_logs/fit/u.out).
+"""
+
+
+def test_retry_keeps_failure_history() -> None:
+    p = LogParser()
+    p.feed(RETRY_LOG.splitlines())
+    job = p.jobs[7]
+    assert job.status is JobStatus.ACTIVE
+    assert job.attempts == 2
+    assert job.external_id == "502"
+    assert job.retried
+    assert job.failed_attempts == 1
+    assert job.failure_message == "LSF-job '501' failed, LSF status is: 'EXIT'"
+    assert job.failure_time == parse_timestamp("Thu Nov  5 12:20:00 2026")
+    assert job.error_message == ""
+    s = p.summary()
+    assert (s.n_active, s.n_failed, s.n_retried) == (1, 0, 1)
+
+    p.feed(["[Thu Nov  5 12:30:00 2026]", "Finished jobid: 7 (Rule: fit)", ""])
+    assert p.jobs[7].status is JobStatus.DONE and p.jobs[7].retried
+    assert p.summary().n_retried == 1
+
+    # Fails again on the last attempt: a plain failure, no longer "retried".
+    p2 = LogParser()
+    p2.feed(RETRY_LOG.splitlines())
+    p2.feed(["Error in rule fit:", "    jobid: 7", "    message: boom", ""])
+    assert p2.jobs[7].failed_attempts == 2 and not p2.jobs[7].retried
+    assert (p2.summary().n_failed, p2.summary().n_retried) == (1, 0)
